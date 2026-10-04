@@ -20,6 +20,7 @@ The `original/` folder contains the unmodified lab files from the course reposit
 | **Sharding** | `manual_shard` only: every worker reads the whole stream and keeps every 4th example (splits *after* reading) | **File-level sharding that splits *before* reading**: hand-written `manual` mode lists the dataset's 4 files and gives each worker its own, plus a `by_node` mode using Hugging Face `split_dataset_by_node`. The original approach is kept as `skip` mode for comparison |
 | **Sharding report** | Prints batch shapes only | Prints a per-worker summary: examples read vs. kept, % wasted reads, time, and the first tokens each worker saw |
 | **Concatenation** | `sum(lists, [])` (quadratic) | `itertools.chain` (linear) |
+| **Testing / CI** | None | 16 pytest tests for the pipeline, run by GitHub Actions on every push |
 
 ## Files
 
@@ -28,6 +29,8 @@ The `original/` folder contains the unmodified lab files from the course reposit
 | `Lab1.ipynb` | In-memory pipeline on the TinyStories validation split (21,990 stories → 35,646 blocks of 128 tokens) |
 | `Lab2.ipynb` | Streaming pipeline over the full 2.1M-story train split with a rolling token buffer |
 | `streaming_shard_qwen.py` | Streaming + 4-process sharding with three modes: `manual`, `by_node`, `skip` |
+| `tests/test_pipeline.py` | pytest tests for blocking, sharding, batching and the Qwen tokenizer |
+| `.github/workflows/tests.yml` | GitHub Actions workflow that runs the tests on every push and pull request |
 | `original/` | Unmodified course lab files |
 
 ## Setup
@@ -57,6 +60,22 @@ python streaming_shard_qwen.py --mode skip      # original lab approach, for com
 | `skip` | After reading | Original `manual_shard`: every worker reads every story and keeps `idx % N == rank` |
 
 Options: `--num-procs` (default 4), `--block-size` (128), `--batch-size` (8), `--batches` (3).
+
+## Tests and CI
+
+```bash
+pip install pytest
+pytest -v
+```
+
+| Area | What the tests check |
+|---|---|
+| Rolling buffer | Every block is exactly `block_size` long; no tokens are lost or reordered; leftover tokens are padded and masked |
+| Sharding | `skip_shard` gives every example to exactly one worker; `assign_files` gives every file to exactly one worker, balanced, including more workers than files |
+| Batching | Batches are `[8, 128]` and `labels` is a copy of `input_ids` |
+| Tokenizer | With the real Qwen2.5 tokenizer, `<|endoftext|>` is appended after every story and decoding restores the original text |
+
+`.github/workflows/tests.yml` runs these tests on GitHub Actions for every push and pull request to `main`.
 
 ## Results
 

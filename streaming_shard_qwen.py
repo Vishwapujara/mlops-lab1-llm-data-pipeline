@@ -2,13 +2,15 @@
 # Streaming + multi-process sharding for causal LM training data.
 # Dataset: TinyStories (4 parquet files)  |  Tokenizer: Qwen2.5
 #
-# Compares two sharding strategies:
-#   manual  - every worker reads the WHOLE stream and keeps every Nth example (original lab)
-#   by_node - Hugging Face split_dataset_by_node: each worker reads only ITS OWN file(s)
+# Compares three sharding strategies:
+#   skip    - every worker reads the WHOLE stream and keeps every Nth example (original lab's manual_shard)
+#   manual  - split BEFORE reading: we list the dataset's files and give each worker its own files
+#   by_node - Hugging Face split_dataset_by_node, which does file-level splitting for us
 #
 # Usage:
-#   python streaming_shard_qwen.py --mode by_node
 #   python streaming_shard_qwen.py --mode manual
+#   python streaming_shard_qwen.py --mode by_node
+#   python streaming_shard_qwen.py --mode skip
 import argparse
 import os
 import time
@@ -19,6 +21,7 @@ import multiprocessing as mp
 from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
+from huggingface_hub import HfApi
 from transformers import AutoTokenizer
 
 DATASET_NAME = "roneneldan/TinyStories"
@@ -37,13 +40,34 @@ class ReadCounter:
 # ============================================================
 # Sharding strategies
 # ============================================================
-def manual_shard(dataset_iter, num_shards, process_index, counter):
-    # Original lab approach: read everything, keep idx % num_shards == process_index
+def skip_shard(dataset_iter, num_shards, process_index, counter):
+    # Original lab's manual_shard: read everything, keep idx % num_shards == process_index
     for idx, example in enumerate(dataset_iter):
         counter.read += 1
         if idx % num_shards == process_index:
             counter.kept += 1
             yield example
+
+
+def list_train_files():
+    # The train split is stored as data/train-0000X-of-00004-*.parquet
+    files = HfApi().list_repo_files(DATASET_NAME, repo_type="dataset")
+    return sorted(f for f in files if f.startswith("data/train-") and f.endswith(".parquet"))
+
+
+def assign_files(files, rank, world_size):
+    # Round-robin: worker r gets files r, r + world_size, r + 2 * world_size, ...
+    return files[rank::world_size]
+
+
+def manual_file_shard(my_files, counter):
+    # Split BEFORE reading: this worker only ever opens its own files
+    urls = [f"hf://datasets/{DATASET_NAME}/{f}" for f in my_files]
+    stream = load_dataset("parquet", data_files=urls, split="train", streaming=True)
+    for example in stream:
+        counter.read += 1
+        counter.kept += 1
+        yield example
 
 
 def node_shard(dataset, rank, world_size, counter):
@@ -106,12 +130,20 @@ def collate_fn(batch):
 # Worker
 # ============================================================
 def worker_entry(rank, world_size, mode, block_size, batch_size, batches_to_show, results):
-    stream_ds = load_dataset(DATASET_NAME, split="train", streaming=True)
     counter = ReadCounter()
 
     if mode == "manual":
-        example_iter = manual_shard(stream_ds, world_size, rank, counter)
+        my_files = assign_files(list_train_files(), rank, world_size)
+        if not my_files:
+            print(f"[rank {rank}] no files assigned (more workers than files), skipping.", flush=True)
+            return
+        print(f"[rank {rank}] assigned files: {[f.split('/')[-1][:20] for f in my_files]}", flush=True)
+        example_iter = manual_file_shard(my_files, counter)
+    elif mode == "skip":
+        stream_ds = load_dataset(DATASET_NAME, split="train", streaming=True)
+        example_iter = skip_shard(stream_ds, world_size, rank, counter)
     else:
+        stream_ds = load_dataset(DATASET_NAME, split="train", streaming=True)
         example_iter = node_shard(stream_ds, rank, world_size, counter)
 
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
@@ -160,7 +192,7 @@ def launch_multi_proc(num_procs, mode, block_size, batch_size, batches_to_show):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Streaming + sharding demo (TinyStories / Qwen2.5)")
-    parser.add_argument("--mode", choices=["manual", "by_node"], default="by_node")
+    parser.add_argument("--mode", choices=["manual", "by_node", "skip"], default="manual")
     parser.add_argument("--num-procs", type=int, default=4)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=8)
